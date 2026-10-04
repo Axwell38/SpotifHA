@@ -45,7 +45,7 @@ def _ssl_context():
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/ssl/cert.pem",
         "/etc/pki/tls/certs/ca-bundle.crt",
-   ]
+    ]
     for path in candidates:
         if os.path.exists(path):
             try:
@@ -266,22 +266,37 @@ class Plugin:
         access_token = await self._ensure_token()
         if not access_token:
             return {"ok": False, "error": "not_authenticated"}
+
+        playlists = []
+        total = None
+        offset = 0
+        page_limit = 50
         try:
-            data = self._api_get("/me/playlists?limit=50", access_token)
+            while True:
+                data = self._api_get(f"/me/playlists?limit={page_limit}&offset={offset}", access_token)
+                if total is None:
+                    total = data.get("total")
+                items = data.get("items", []) or []
+                decky_plugin.logger.info(
+                    f"SpotifHA: get_playlists page offset={offset} recus={len(items)} total_annonce={total}"
+                )
+                for item in items:
+                    if not item:
+                        continue
+                    images = item.get("images") or []
+                    playlists.append({
+                        "uri": item.get("uri"),
+                        "name": item.get("name"),
+                        "image": images[0]["url"] if images else None,
+                    })
+                if not items or (total is not None and offset + len(items) >= total):
+                    break
+                offset += page_limit
         except Exception:
             decky_plugin.logger.error("SpotifHA: echec get_playlists:\n" + traceback.format_exc())
             return {"ok": False, "error": "request_failed"}
 
-        playlists = []
-        for item in data.get("items", []) or []:
-            if not item:
-                continue
-            images = item.get("images") or []
-            playlists.append({
-                "uri": item.get("uri"),
-                "name": item.get("name"),
-                "image": images[0]["url"] if images else None,
-            })
+        decky_plugin.logger.info(f"SpotifHA: get_playlists termine, {len(playlists)} playlists retournees")
         return {"ok": True, "playlists": playlists}
 
     async def search(self, query: str):
@@ -296,7 +311,9 @@ class Plugin:
             return {"ok": False, "error": "empty_query"}
 
         q = urllib.parse.quote(query)
-        path = f"/search?q={q}&type=track,playlist&limit=15"
+        # Spotify limite les apps en mode developpement a 10 resultats par type
+        # sur /v1/search (une limite plus haute renvoie 400 "Invalid limit").
+        path = f"/search?q={q}&type=track,playlist&limit=10"
         try:
             data = self._api_get(path, access_token)
         except urllib.error.HTTPError as e:
@@ -401,10 +418,13 @@ class Plugin:
         return {"ok": self._mpris_set_property("Volume", "double", volume)}
 
     async def get_playback_state(self):
+        decky_plugin.logger.info("SpotifHA: get_playback_state appele")
         raw = self._mpris_get_all()
         if raw is None:
+            decky_plugin.logger.error("SpotifHA: get_playback_state, raw=None (mpris indisponible)")
             return {"ok": False, "error": "mpris_unavailable"}
         parsed = _parse_mpris_getall(raw)
+        decky_plugin.logger.info(f"SpotifHA: get_playback_state parse -> {parsed}")
         return {"ok": True, **parsed}
 
 
@@ -426,12 +446,12 @@ def _parse_mpris_getall(raw: str):
     }
 
     # PlaybackStatus
-    m = re.search(r'"PlaybackStatus"\svvariant\s*string\s*"([^"]+)"', raw)
+    m = re.search(r'"PlaybackStatus"\s*variant\s*string\s*"([^"]*)"', raw)
     if m:
         result["status"] = m.group(1)
 
     # Volume
-    m = re.search(r'"Volume"\svvariant\s*double\s*([0-9.]+)', raw)
+    m = re.search(r'"Volume"\s*variant\s*double\s*([0-9.]+)', raw)
     if m:
         try:
             result["volume"] = float(m.group(1))
@@ -439,7 +459,7 @@ def _parse_mpris_getall(raw: str):
             pass
 
     # Position (microseconds)
-    m = re.search(r'"Position"\svvariant\s*int64\s*(\d+)', raw)
+    m = re.search(r'"Position"\s*variant\s*int64\s*(\d+)', raw)
     if m:
         try:
             result["position"] = int(m.group(1))
@@ -450,7 +470,7 @@ def _parse_mpris_getall(raw: str):
     meta_match = re.search(r'"Metadata".*', raw, re.DOTALL)
     meta_text = meta_match.group(0) if meta_match else raw
 
-    m = re.search(r'"xesam:title"\svvariant\s*string\s*"([^"]+)"', meta_text)
+    m = re.search(r'"xesam:title"\s*variant\s*string\s*"([^"]*)"', meta_text)
     if m:
         result["title"] = m.group(1)
 
@@ -461,7 +481,7 @@ def _parse_mpris_getall(raw: str):
     # xesam:artist est un array de strings ; on prend toutes les valeurs string
     # qui suivent "xesam:artist" jusqu'a la cle suivante.
     artist_block_match = re.search(
-        r'"xesam:artist"\svvariant\s*array\s*\[(.*?)\]', meta_text, re.DOTALL
+        r'"xesam:artist"\s*variant\s*array\s*\[(.*?)\]', meta_text, re.DOTALL
     )
     if artist_block_match:
         names = re.findall(r'string\s*"([^"]*)"', artist_block_match.group(1))

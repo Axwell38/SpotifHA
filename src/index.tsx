@@ -1,107 +1,269 @@
 import {
-  ButtonItem,
-  DialogButton,
   PanelSection,
   PanelSectionRow,
+  ButtonItem,
+  DialogButton,
   TextField,
   Focusable,
+  Navigation,
   staticClasses,
 } from "@decky/ui";
-import { callable, definePlugin } from "@decky/api";
+import { callable, definePlugin, routerHook } from "@decky/api";
 import { useEffect, useState, VFC } from "react";
-import { FaSpotify, FaStepBackward, FaStepForward, FaPlayCircle } from "react-icons/fa";
+import { FaSpotify } from "react-icons/fa";
+import { IoPlaySkipBack, IoPlayCircle, IoPauseCircle, IoPlaySkipForward } from "react-icons/io5";
 
-// -- Wrappers typés autour des méthodes du backend Python --------------------
+// ---------- Backend calls ----------
 
-const getStatus = callable<[], { has_client_id: boolean; is_authenticated: boolean; redirect_uri: string }>(
-  "get_status"
-);
-const setClientId = callable<[client_id: string], { ok: boolean }>("set_client_id");
-const startAuth = callable<[], { ok: boolean; auth_url?: string; error?: string }>("start_auth");
+type StatusResult = { has_client_id: boolean; is_authenticated: boolean; redirect_uri: string };
+type StartAuthResult = { ok: boolean; auth_url?: string; error?: string };
 type PlaylistsResult = { ok: boolean; playlists?: { uri: string; name: string; image: string | null }[]; error?: string };
-const getPlaylists = callable<[], PlaylistsResult>("get_playlists");
-const playPause = callable<[], { ok: boolean }>("play_pause");
-const nextTrack = callable<[], { ok: boolean }>("next_track");
-const previousTrack = callable<[], { ok: boolean }>("previous_track");
-const openUri = callable<[uri: string], { ok: boolean }>("open_uri");
 type SearchResult = {
   ok: boolean;
   tracks?: { uri: string; name: string; artist: string }[];
   playlists?: { uri: string; name: string }[];
   error?: string;
 };
-const search = callable<[query: string], SearchResult>("search");
+type PlaybackState = {
+  ok: boolean;
+  status?: string | null;
+  title?: string | null;
+  artist?: string | null;
+  art_url?: string | null;
+  error?: string;
+};
 
-type Playlist = { uri: string; name: string; image: string | null };
+const getStatus = callable<[], StatusResult>("get_status");
+const setClientId = callable<[string], { ok: boolean }>("set_client_id");
+const startAuth = callable<[], StartAuthResult>("start_auth");
+const getPlaylists = callable<[], PlaylistsResult>("get_playlists");
+const search = callable<[string], SearchResult>("search");
+const playPause = callable<[], { ok: boolean }>("play_pause");
+const nextTrack = callable<[], { ok: boolean }>("next_track");
+const previousTrack = callable<[], { ok: boolean }>("previous_track");
+const openUri = callable<[string], { ok: boolean }>("open_uri");
+const getPlaybackState = callable<[], PlaybackState>("get_playback_state");
+
+const PLAYLISTS_ROUTE = "/spotifha-playlists";
+
+// ---------- Now playing block (pochette + artiste + titre) ----------
+
+const NowPlaying: VFC<{ state: PlaybackState | null }> = ({ state }) => {
+  const title = state?.title || "Aucune lecture en cours";
+  const artist = state?.artist || "";
+  const art = state?.art_url || null;
+
+  return (
+    <PanelSectionRow>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", width: "100%" }}>
+        <div
+          style={{
+            width: "140px",
+            height: "140px",
+            borderRadius: "6px",
+            overflow: "hidden",
+            background: "#222",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            marginBottom: "8px",
+          }}
+        >
+          {art ? (
+            <img src={art} alt="cover" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+          ) : (
+            <FaSpotify size={48} color="#1DB954" />
+          )}
+        </div>
+        <div style={{ fontSize: "13px", opacity: 0.8, textAlign: "center" }}>{artist}</div>
+        <div style={{ fontSize: "15px", fontWeight: 600, textAlign: "center" }}>{title}</div>
+      </div>
+    </PanelSectionRow>
+  );
+};
+
+// ---------- Playback controls row ----------
+
+const PlaybackControls: VFC<{ isPlaying: boolean; onAfterAction: () => void }> = ({ isPlaying, onAfterAction }) => {
+  const btnStyle = {
+    width: "60px",
+    minWidth: "60px",
+    padding: "10px 0",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  };
+  const iconSize = 26;
+
+  const handle = async (action: () => Promise<{ ok: boolean }>) => {
+    await action();
+    onAfterAction();
+  };
+
+  return (
+    <PanelSectionRow>
+      <Focusable style={{ display: "flex", justifyContent: "center", gap: "8px", width: "100%" }}>
+        <DialogButton style={btnStyle} onClick={() => handle(previousTrack)}>
+          <IoPlaySkipBack size={iconSize} />
+        </DialogButton>
+        <DialogButton style={btnStyle} onClick={() => handle(playPause)}>
+          {isPlaying ? <IoPauseCircle size={iconSize} /> : <IoPlayCircle size={iconSize} />}
+        </DialogButton>
+        <DialogButton style={btnStyle} onClick={() => handle(nextTrack)}>
+          <IoPlaySkipForward size={iconSize} />
+        </DialogButton>
+      </Focusable>
+    </PanelSectionRow>
+  );
+};
+
+// ---------- Separate "Playlists" page ----------
+
+const PlaylistsPage: VFC = () => {
+  const [playlists, setPlaylists] = useState<PlaylistsResult["playlists"]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      const res = await getPlaylists();
+      if (res.ok) {
+        setPlaylists(res.playlists || []);
+        setError(null);
+      } else {
+        setError(res.error || "unknown_error");
+      }
+      setLoading(false);
+    })();
+  }, []);
+
+  return (
+    <div style={{ marginTop: "40px", padding: "0 10px" }}>
+      <PanelSection title="Tes playlists">
+        {loading && <PanelSectionRow>Chargement...</PanelSectionRow>}
+        {!loading && error && <PanelSectionRow>Erreur: {error}</PanelSectionRow>}
+        {!loading && !error && (playlists?.length ?? 0) === 0 && (
+          <PanelSectionRow>Aucune playlist trouvee.</PanelSectionRow>
+        )}
+        {!loading &&
+          playlists?.map((p) => (
+            <PanelSectionRow key={p.uri}>
+              <ButtonItem layout="below" onClick={() => openUri(p.uri)}>
+                {p.name}
+              </ButtonItem>
+            </PanelSectionRow>
+          ))}
+      </PanelSection>
+    </div>
+  );
+};
+
+// ---------- Main QAM panel ----------
 
 const Content: VFC = () => {
-  const [hasClientId, setHasClientId] = useState(false);
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [status, setStatus] = useState<StatusResult | null>(null);
   const [clientIdInput, setClientIdInput] = useState("");
-  const [redirectUri, setRedirectUri] = useState("");
-  const [playlists, setPlaylists] = useState<Playlist[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [authUrl, setAuthUrl] = useState("");
-  const [copied, setCopied] = useState(false);
+  const [authUrl, setAuthUrl] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult | null>(null);
   const [searching, setSearching] = useState(false);
+  const [playbackState, setPlaybackState] = useState<PlaybackState | null>(null);
+
+  const refreshPlayback = async () => {
+    try {
+      const res = await getPlaybackState();
+      setPlaybackState(res);
+    } catch {
+      // on retentera au prochain tick
+    }
+  };
+
+  useEffect(() => {
+    if (!status?.is_authenticated) return;
+    refreshPlayback();
+    const id = setInterval(refreshPlayback, 3000);
+    return () => clearInterval(id);
+  }, [status?.is_authenticated]);
 
   const refreshStatus = async () => {
-    const status = await getStatus();
-    setHasClientId(status.has_client_id);
-    setIsAuthenticated(status.is_authenticated);
-    setRedirectUri(status.redirect_uri);
+    const s = await getStatus();
+    setStatus(s);
+    return s;
   };
 
   useEffect(() => {
     refreshStatus();
   }, []);
 
-  // Une fois qu'un lien de connexion a été généré, on vérifie toutes les
-  // 3 secondes si la connexion a abouti côté backend (le serveur local
-  // attend la redirection en arrière-plan pendant 10 minutes).
+  // Poll tant qu'on attend la connexion OAuth
   useEffect(() => {
-    if (!authUrl || isAuthenticated) return;
-    const interval = setInterval(async () => {
-      const status = await getStatus();
-      if (status.is_authenticated) {
-        setIsAuthenticated(true);
-        setAuthUrl("");
+    if (!authUrl) return;
+    const id = setInterval(async () => {
+      const s = await refreshStatus();
+      if (s.is_authenticated) {
+        setAuthUrl(null);
+        clearInterval(id);
       }
     }, 3000);
-    return () => clearInterval(interval);
-  }, [authUrl, isAuthenticated]);
+    return () => clearInterval(id);
+  }, [authUrl]);
 
-  useEffect(() => {
-    if (isAuthenticated) {
-      setLoading(true);
-      getPlaylists()
-        .then((res) => {
-          if (res.ok && res.playlists) setPlaylists(res.playlists);
-        })
-        .finally(() => setLoading(false));
+  const handleSaveClientId = async () => {
+    if (!clientIdInput.trim()) return;
+    await setClientId(clientIdInput.trim());
+    await refreshStatus();
+  };
+
+  const handleStartAuth = async () => {
+    const res = await startAuth();
+    if (res.ok && res.auth_url) {
+      setAuthUrl(res.auth_url);
     }
-  }, [isAuthenticated]);
+  };
 
-  // -- Étape 1 : pas encore de Client ID -------------------------------------
-  if (!hasClientId) {
+  const handleSearch = async () => {
+    const q = searchQuery.trim();
+    if (!q) return;
+    setSearching(true);
+    try {
+      const res = await search(q);
+      setSearchResults(res);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const openPlaylistsPage = () => {
+    Navigation.Navigate(PLAYLISTS_ROUTE);
+    Navigation.CloseSideMenus();
+  };
+
+  if (!status) {
     return (
-      <PanelSection title="Connexion Spotify">
-        <PanelSectionRow>
-          Crée une app sur le tableau de bord développeur Spotify, puis colle
-          son Client ID ci-dessous.
-        </PanelSectionRow>
+      <PanelSection>
+        <PanelSectionRow>Chargement...</PanelSectionRow>
+      </PanelSection>
+    );
+  }
+
+  // Etape 1 : pas de Client ID enregistre
+  if (!status.has_client_id) {
+    return (
+      <PanelSection title="Configuration Spotify">
         <PanelSectionRow>
           <ButtonItem
             layout="below"
             onClick={() => window.open("https://developer.spotify.com/dashboard/create", "_blank")}
           >
-            Ouvrir le tableau de bord Spotify
+            Ouvrir le dashboard développeur Spotify
           </ButtonItem>
         </PanelSectionRow>
         <PanelSectionRow>
-          Redirect URI à coller dans le formulaire : {redirectUri || "http://127.0.0.1:8069/callback"}
+          Crée une app Spotify, puis ajoute cette Redirect URI exactement :
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <TextField value={status.redirect_uri} disabled />
         </PanelSectionRow>
         <PanelSectionRow>
           <TextField
@@ -111,14 +273,7 @@ const Content: VFC = () => {
           />
         </PanelSectionRow>
         <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            disabled={!clientIdInput.trim()}
-            onClick={async () => {
-              await setClientId(clientIdInput.trim());
-              await refreshStatus();
-            }}
-          >
+          <ButtonItem layout="below" onClick={handleSaveClientId}>
             Enregistrer
           </ButtonItem>
         </PanelSectionRow>
@@ -126,164 +281,110 @@ const Content: VFC = () => {
     );
   }
 
-  // -- Étape 2 : Client ID connu, pas encore connecté avec un compte Spotify --
-  if (!isAuthenticated) {
-    if (!authUrl) {
-      return (
-        <PanelSection title="Connexion Spotify">
-          <PanelSectionRow>
-            <ButtonItem
-              layout="below"
-              onClick={async () => {
-                setLoading(true);
-                const res = await startAuth();
-                setLoading(false);
-                if (res.ok && res.auth_url) setAuthUrl(res.auth_url);
-              }}
-            >
-              {loading ? "Génération du lien…" : "Se connecter à Spotify"}
-            </ButtonItem>
-          </PanelSectionRow>
-        </PanelSection>
-      );
-    }
-
-    // Lien généré : le login Spotify (protégé par reCAPTCHA) ne s'affiche
-    // dans aucun navigateur embarqué de Steam, et Spotify interdit les
-    // redirect URI en HTTP hors loopback (127.0.0.1) — la connexion doit
-    // donc se faire dans un vrai navigateur (Firefox) SUR le Deck lui-même.
+  // Etape 2 : Client ID present mais pas encore authentifie
+  if (!status.is_authenticated) {
     return (
       <PanelSection title="Connexion Spotify">
-        <PanelSectionRow>
-          Fais cette étape depuis le Mode Bureau : Steam → bascule en mode
-          Big Picture (icône en haut à droite du client Steam) pour retrouver
-          ce panneau sans quitter le Bureau — le copier-coller vers Firefox
-          fonctionne alors normalement.
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            onClick={async () => {
-              try {
-                await navigator.clipboard.writeText(authUrl);
-                setCopied(true);
-                setTimeout(() => setCopied(false), 2000);
-              } catch {
-                // le champ ci-dessous reste sélectionnable manuellement
-              }
-            }}
-          >
-            {copied ? "Copié !" : "Copier le lien"}
-          </ButtonItem>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <TextField value={authUrl} disabled />
-        </PanelSectionRow>
-        <PanelSectionRow>
-          Colle-le ensuite dans Firefox (déjà présent sur le Bureau). En
-          attente de connexion… reviens ici une fois connecté, cet écran
-          passe automatiquement à la suite.
-        </PanelSectionRow>
+        {!authUrl && (
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={handleStartAuth}>
+              Se connecter à Spotify
+            </ButtonItem>
+          </PanelSectionRow>
+        )}
+        {authUrl && (
+          <>
+            <PanelSectionRow>
+              Depuis le Mode Bureau (Steam → Mode Bureau), ouvre Firefox et colle ce lien :
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <TextField value={authUrl} disabled />
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <ButtonItem layout="below" onClick={() => navigator.clipboard.writeText(authUrl)}>
+                Copier le lien
+              </ButtonItem>
+            </PanelSectionRow>
+            <PanelSectionRow>
+              En attente de connexion... reviens sur le Deck une fois connecté.
+            </PanelSectionRow>
+          </>
+        )}
       </PanelSection>
     );
   }
 
-  // -- Étape 3 : connecté — contrôles + playlists ------------------------------
+  // Etape 3 : connecte
   return (
     <>
-      <PanelSection title="Lecture">
-        <PanelSectionRow>
-          <Focusable style={{ display: "flex", gap: "8px", justifyContent: "center" }}>
-            <DialogButton
-              style={{ width: "60px", minWidth: "60px", padding: "10px 0" }}
-              onClick={() => previousTrack()}
-            >
-              <FaStepBackward />
-            </DialogButton>
-            <DialogButton
-              style={{ width: "60px", minWidth: "60px", padding: "10px 0" }}
-              onClick={() => playPause()}
-            >
-              <FaPlayCircle />
-            </DialogButton>
-            <DialogButton
-              style={{ width: "60px", minWidth: "60px", padding: "10px 0" }}
-              onClick={() => nextTrack()}
-            >
-              <FaStepForward />
-            </DialogButton>
-          </Focusable>
-        </PanelSectionRow>
+      <PanelSection>
+        <NowPlaying state={playbackState} />
+        <PlaybackControls
+          isPlaying={playbackState?.status === "Playing"}
+          onAfterAction={refreshPlayback}
+        />
       </PanelSection>
 
-      <PanelSection title="Rechercher">
+      <PanelSection title="Recherche">
         <PanelSectionRow>
           <TextField
+            label="Titre, artiste..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            label="Titre, artiste, playlist…"
           />
         </PanelSectionRow>
         <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            disabled={!searchQuery.trim()}
-            onClick={async () => {
-              setSearching(true);
-              const res = await search(searchQuery.trim());
-              setSearching(false);
-              setSearchResults(res);
-            }}
-          >
-            {searching ? "Recherche…" : "Rechercher"}
+          <ButtonItem layout="below" onClick={handleSearch} disabled={searching}>
+            {searching ? "Recherche..." : "Rechercher"}
           </ButtonItem>
         </PanelSectionRow>
-        {searchResults && searchResults.ok && (
+        {searchResults && !searchResults.ok && (
+          <PanelSectionRow>Erreur de recherche : {searchResults.error}</PanelSectionRow>
+        )}
+        {searchResults?.ok && (
           <>
-            {(searchResults.playlists?.length ?? 0) === 0 &&
-              (searchResults.tracks?.length ?? 0) === 0 && (
-                <PanelSectionRow>Aucun résultat.</PanelSectionRow>
-              )}
-            {searchResults.playlists?.map((pl) => (
-              <PanelSectionRow key={pl.uri}>
-                <ButtonItem layout="below" onClick={() => openUri(pl.uri)}>
-                  📁 {pl.name}
+            {(searchResults.playlists ?? []).map((p) => (
+              <PanelSectionRow key={p.uri}>
+                <ButtonItem layout="below" onClick={() => openUri(p.uri)}>
+                  📁 {p.name}
                 </ButtonItem>
               </PanelSectionRow>
             ))}
-            {searchResults.tracks?.map((t) => (
+            {(searchResults.tracks ?? []).map((t) => (
               <PanelSectionRow key={t.uri}>
                 <ButtonItem layout="below" onClick={() => openUri(t.uri)}>
                   {t.name} — {t.artist}
                 </ButtonItem>
               </PanelSectionRow>
             ))}
+            {(searchResults.tracks?.length ?? 0) === 0 && (searchResults.playlists?.length ?? 0) === 0 && (
+              <PanelSectionRow>Aucun résultat.</PanelSectionRow>
+            )}
           </>
         )}
       </PanelSection>
 
-      <PanelSection title="Tes playlists">
-        {loading && <PanelSectionRow>Chargement…</PanelSectionRow>}
-        {!loading && playlists.length === 0 && (
-          <PanelSectionRow>Aucune playlist trouvée.</PanelSectionRow>
-        )}
-        {playlists.map((pl) => (
-          <PanelSectionRow key={pl.uri}>
-            <ButtonItem layout="below" onClick={() => openUri(pl.uri)}>
-              {pl.name}
-            </ButtonItem>
-          </PanelSectionRow>
-        ))}
+      <PanelSection>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={openPlaylistsPage}>
+            Playlists
+          </ButtonItem>
+        </PanelSectionRow>
       </PanelSection>
     </>
   );
 };
 
 export default definePlugin(() => {
+  routerHook.addRoute(PLAYLISTS_ROUTE, PlaylistsPage, { exact: true });
+
   return {
     name: "SpotifHA",
-    titleView: <div className={staticClasses.Title}>Spotify</div>,
+    title: <div className={staticClasses.Title}>SpotifHA</div>,
     content: <Content />,
     icon: <FaSpotify />,
+    onDismount() {
+      routerHook.removeRoute(PLAYLISTS_ROUTE);
+    },
   };
 });
