@@ -1,325 +1,471 @@
-"""
-SpotifHA backend
-
-Deux canaux de contrôle, volontairement séparés :
-  - MPRIS/DBus : play/pause/next/prev/volume/seek + ouverture d'une URI
-    (playlist/morceau) sur le client Spotify local. Aucune auth requise.
-  - Web API (OAuth PKCE) : lecture seule, pour parcourir/rechercher les
-    playlists de l'utilisateur et récupérer leurs URIs/pochettes.
-
-Chaque utilisateur fournit son propre Client ID (créé sur
-developer.spotify.com/dashboard) — voir README.md. Aucun secret n'est
-jamais stocké : le flow PKCE ne nécessite qu'un Client ID public.
-"""
-
-import asyncio
-import base64
-import hashlib
-import http.server
+import os
+import re
 import json
+import ssl
+import time
 import secrets
-import threading
-import urllib.parse
+import hashlib
+import base64
+import asyncio
+import subprocess
 import urllib.request
-from pathlib import Path
+import urllib.parse
+import urllib.error
+import http.server
+import threading
+import traceback
 
-import decky_plugin  # fourni par le runtime Decky
+import decky_plugin
 
-# --- Config ---------------------------------------------------------------
-
-REDIRECT_URI = "http://127.0.0.1:8069/callback"
 REDIRECT_PORT = 8069
 SCOPES = "playlist-read-private playlist-read-collaborative user-read-playback-state"
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 
-SETTINGS_PATH = Path(decky_plugin.DECKY_PLUGIN_SETTINGS_DIR) / "settings.json"
+SETTINGS_PATH = os.path.join(decky_plugin.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
 
 MPRIS_BUS_NAME = "org.mpris.MediaPlayer2.spotify"
 MPRIS_PATH = "/org/mpris/MediaPlayer2"
 MPRIS_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
+MPRIS_PROPS_IFACE = "org.freedesktop.DBus.Properties"
 
 
-def _load_settings() -> dict:
-    if SETTINGS_PATH.exists():
-        return json.loads(SETTINGS_PATH.read_text())
-    return {}
+def _clean_subprocess_env():
+    env = dict(os.environ)
+    env.pop("LD_LIBRARY_PATH", None)
+    env.pop("LD_PRELOAD", None)
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        uid = os.getuid()
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
+    return env
 
 
-def _save_settings(data: dict) -> None:
-    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_PATH.write_text(json.dumps(data, indent=2))
+def _ssl_context():
+    candidates = [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/cert.pem",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+   ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                ctx = ssl.create_default_context(cafile=path)
+                return ctx
+            except Exception:
+                continue
+    return ssl.create_default_context()
 
 
-# --- PKCE helpers -----------------------------------------------------------
+def _load_settings():
+    try:
+        with open(SETTINGS_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-def _new_pkce_pair() -> tuple[str, str]:
-    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode()
-    challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(verifier.encode()).digest()
-    ).rstrip(b"=").decode()
+
+def _save_settings(data):
+    os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+    with open(SETTINGS_PATH, "w") as f:
+        json.dump(data, f)
+
+
+def _new_pkce_pair():
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).decode("utf-8").rstrip("=")
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    challenge = base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
     return verifier, challenge
 
 
-class _CallbackServer:
-    """Petit serveur HTTP local qui n'existe que le temps de récupérer le
-    `code` renvoyé par Spotify après connexion de l'utilisateur."""
+class _CallbackServer(http.server.HTTPServer):
+    allow_reuse_address = True
 
-    def __init__(self):
-        self.code: str | None = None
-        self.error: str | None = None
-        self._server: http.server.HTTPServer | None = None
+    def __init__(self, *args, timeout_seconds=65, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.code = None
+        self.error = None
+        self.timeout = timeout_seconds
 
-    def start(self):
-        handler = self._make_handler()
-        self._server = http.server.HTTPServer(("127.0.0.1", REDIRECT_PORT), handler)
-        thread = threading.Thread(target=self._server.handle_request, daemon=True)
-        thread.start()
-        return thread
 
-    def _make_handler(self):
-        outer = self
+class _CallbackHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "code" in qs:
+            self.server.code = qs["code"][0]
+            body = b"<html><body><h1>Connecte ! Tu peux revenir sur le Deck.</h1></body></html>"
+        else:
+            self.server.error = qs.get("error", ["unknown_error"])[0]
+            body = b"<html><body><h1>Erreur de connexion Spotify.</h1></body></html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                parsed = urllib.parse.urlparse(self.path)
-                qs = urllib.parse.parse_qs(parsed.query)
-                outer.code = qs.get("code", [None])[0]
-                outer.error = qs.get("error", [None])[0]
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.end_headers()
-                msg = "Connecté ! Tu peux revenir sur le Deck." if outer.code else "Échec de la connexion."
-                self.wfile.write(f"<html><body><h2>{msg}</h2></body></html>".encode())
-
-            def log_message(self, *args):
-                pass  # silence le logging par défaut de http.server
-
-        return Handler
+    def log_message(self, fmt, *args):
+        pass
 
 
 class Plugin:
-    _auth_state: dict = {}
-
-    # -- lifecycle -----------------------------------------------------------
-
     async def _main(self):
-        decky_plugin.logger.info("SpotifHA: backend démarré")
+        self.redirect_uri = f"http://127.0.0.1:{REDIRECT_PORT}/callback"
+        decky_plugin.logger.info(f"SpotifHA: backend demarre, redirect_uri={self.redirect_uri}")
 
     async def _unload(self):
-        decky_plugin.logger.info("SpotifHA: backend arrêté")
+        decky_plugin.logger.info("SpotifHA: backend arrete")
 
-    # -- settings --------------------------------------------------------------
+    # ---------- Settings / auth status ----------
 
-    async def set_client_id(self, client_id: str) -> dict:
+    async def set_client_id(self, client_id: str):
         settings = _load_settings()
         settings["client_id"] = client_id.strip()
         _save_settings(settings)
         return {"ok": True}
 
-    async def get_status(self) -> dict:
+    async def get_status(self):
         settings = _load_settings()
         return {
             "has_client_id": bool(settings.get("client_id")),
-            "is_authenticated": bool(settings.get("refresh_token")),
-            "redirect_uri": REDIRECT_URI,
+            "is_authenticated": bool(settings.get("access_token")),
+            "redirect_uri": getattr(self, "redirect_uri", f"http://127.0.0.1:{REDIRECT_PORT}/callback"),
         }
 
-    # -- OAuth PKCE ------------------------------------------------------------
+    # ---------- OAuth PKCE flow ----------
 
-    async def start_auth(self) -> dict:
+    async def start_auth(self):
         settings = _load_settings()
         client_id = settings.get("client_id")
         if not client_id:
             return {"ok": False, "error": "no_client_id"}
 
         verifier, challenge = _new_pkce_pair()
-        self._auth_state["verifier"] = verifier
+        settings["pkce_verifier"] = verifier
+        _save_settings(settings)
 
         params = {
             "client_id": client_id,
             "response_type": "code",
-            "redirect_uri": REDIRECT_URI,
+            "redirect_uri": self.redirect_uri,
             "scope": SCOPES,
             "code_challenge_method": "S256",
             "code_challenge": challenge,
         }
         auth_url = f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
 
-        server = _CallbackServer()
-        server.start()
+        try:
+            server = _CallbackServer(("127.0.0.1", REDIRECT_PORT), _CallbackHandler, timeout_seconds=600)
+        except OSError as e:
+            decky_plugin.logger.error(f"SpotifHA: impossible d'ouvrir le port {REDIRECT_PORT}: {e}")
+            return {"ok": False, "error": "port_busy"}
 
-        # Ouvre le navigateur système sur le Deck (Konsole/Game Mode -> mode bureau,
-        # ou xdg-open si disponible dans l'environnement du plugin).
-        import webbrowser
-        webbrowser.open(auth_url)
+        asyncio.create_task(self._wait_for_callback(server, verifier, client_id))
+        return {"ok": True, "auth_url": auth_url}
 
-        # Attend la redirection (timeout raisonnable pour ne pas bloquer le QAM)
-        for _ in range(600):  # ~60s
-            if server.code or server.error:
-                break
-            await asyncio.sleep(0.1)
+    async def _wait_for_callback(self, server, verifier, client_id):
+        deadline = time.time() + 600
+        try:
+            while time.time() < deadline:
+                server.handle_request()
+                if server.code or server.error:
+                    break
+            if server.code:
+                await self._exchange_code(server.code, verifier, client_id)
+            elif server.error:
+                decky_plugin.logger.error(f"SpotifHA: erreur callback OAuth: {server.error}")
+        except Exception:
+            decky_plugin.logger.error("SpotifHA: exception pendant l'attente du callback:\n" + traceback.format_exc())
+        finally:
+            try:
+                server.close()
+                server.server_close()
+            except Exception:
+                pass
 
-        if server.error or not server.code:
-            return {"ok": False, "error": server.error or "timeout"}
-
-        return await self._exchange_code(server.code, verifier, client_id)
-
-    async def _exchange_code(self, code: str, verifier: str, client_id: str) -> dict:
+    async def _exchange_code(self, code, verifier, client_id):
         data = urllib.parse.urlencode({
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": REDIRECT_URI,
+            "redirect_uri": self.redirect_uri,
             "client_id": client_id,
             "code_verifier": verifier,
-        }).encode()
+        }).encode("utf-8")
 
         req = urllib.request.Request(TOKEN_URL, data=data, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
         try:
-            with urllib.request.urlopen(req) as resp:
-                payload = json.loads(resp.read())
-        except Exception as e:
-            decky_plugin.logger.error(f"SpotifHA: échange de token échoué: {e}")
-            return {"ok": False, "error": "token_exchange_failed"}
+            with urllib.request.urlopen(req, context=_ssl_context(), timeout=30) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            decky_plugin.logger.error("SpotifHA: echec exchange_code:\n" + traceback.format_exc())
+            return
 
         settings = _load_settings()
-        settings["refresh_token"] = payload["refresh_token"]
-        settings["access_token"] = payload["access_token"]
+        settings["access_token"] = payload.get("access_token")
+        settings["refresh_token"] = payload.get("refresh_token", settings.get("refresh_token"))
+        settings["expires_at"] = time.time() + payload.get("expires_in", 3600) - 60
+        settings.pop("pkce_verifier", None)
         _save_settings(settings)
-        return {"ok": True}
+        decky_plugin.logger.info("SpotifHA: token obtenu avec succes")
 
-    async def _refresh_access_token(self) -> str | None:
+    async def _refresh_access_token(self):
         settings = _load_settings()
-        client_id = settings.get("client_id")
         refresh_token = settings.get("refresh_token")
-        if not client_id or not refresh_token:
-            return None
+        client_id = settings.get("client_id")
+        if not refresh_token or not client_id:
+            return False
 
         data = urllib.parse.urlencode({
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": client_id,
-        }).encode()
+        }).encode("utf-8")
+
         req = urllib.request.Request(TOKEN_URL, data=data, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
         try:
-            with urllib.request.urlopen(req) as resp:
-                payload = json.loads(resp.read())
-        except Exception as e:
-            decky_plugin.logger.error(f"SpotifHA: refresh token échoué: {e}")
-            return None
+            with urllib.request.urlopen(req, context=_ssl_context(), timeout=30) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            decky_plugin.logger.error("SpotifHA: echec refresh_token:\n" + traceback.format_exc())
+            return False
 
-        settings["access_token"] = payload["access_token"]
-        if "refresh_token" in payload:  # Spotify en renvoie parfois un nouveau
-            settings["refresh_token"] = payload["refresh_token"]
+        settings["access_token"] = payload.get("access_token")
+        if payload.get("refresh_token"):
+            settings["refresh_token"] = payload.get("refresh_token")
+        settings["expires_at"] = time.time() + payload.get("expires_in", 3600) - 60
         _save_settings(settings)
-        return payload["access_token"]
+        return True
 
-    # -- Web API (lecture seule : playlists / recherche) ------------------------
+    async def _ensure_token(self):
+        """Renvoie un access_token valide, en le rafraichissant si besoin. None si pas connecte."""
+        settings = _load_settings()
+        access_token = settings.get("access_token")
+        if not access_token:
+            return None
+        expires_at = settings.get("expires_at", 0)
+        if time.time() >= expires_at:
+            ok = await self._refresh_access_token()
+            if not ok:
+                return None
+            settings = _load_settings()
+            access_token = settings.get("access_token")
+        return access_token
 
-    async def get_playlists(self) -> dict:
-        token = await self._refresh_access_token()
-        if not token:
+    def _api_get(self, path, access_token):
+        req = urllib.request.Request(f"https://api.spotify.com/v1{path}")
+        req.add_header("Authorization", f"Bearer {access_token}")
+        with urllib.request.urlopen(req, context=_ssl_context(), timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    # ---------- Spotify Web API ----------
+
+    async def get_playlists(self):
+        access_token = await self._ensure_token()
+        if not access_token:
             return {"ok": False, "error": "not_authenticated"}
-
-        req = urllib.request.Request(
-            "https://api.spotify.com/v1/me/playlists?limit=50"
-        )
-        req.add_header("Authorization", f"Bearer {token}")
         try:
-            with urllib.request.urlopen(req) as resp:
-                payload = json.loads(resp.read())
-        except Exception as e:
-            decky_plugin.logger.error(f"SpotifHA: get_playlists échoué: {e}")
-            return {"ok": False, "error": "api_error"}
+            data = self._api_get("/me/playlists?limit=50", access_token)
+        except Exception:
+            decky_plugin.logger.error("SpotifHA: echec get_playlists:\n" + traceback.format_exc())
+            return {"ok": False, "error": "request_failed"}
 
-        playlists = [
-            {
-                "uri": item["uri"],
-                "name": item["name"],
-                "image": (item["images"][0]["url"] if item.get("images") else None),
-            }
-            for item in payload.get("items", [])
-        ]
+        playlists = []
+        for item in data.get("items", []) or []:
+            if not item:
+                continue
+            images = item.get("images") or []
+            playlists.append({
+                "uri": item.get("uri"),
+                "name": item.get("name"),
+                "image": images[0]["url"] if images else None,
+            })
         return {"ok": True, "playlists": playlists}
 
-    async def search(self, query: str) -> dict:
-        token = await self._refresh_access_token()
-        if not token:
+    async def search(self, query: str):
+        decky_plugin.logger.info(f"SpotifHA: recherche demandee: {query!r}")
+        access_token = await self._ensure_token()
+        if not access_token:
+            decky_plugin.logger.error("SpotifHA: recherche refusee, pas de token (non authentifie)")
             return {"ok": False, "error": "not_authenticated"}
 
-        params = urllib.parse.urlencode({"q": query, "type": "playlist,track", "limit": 15})
-        req = urllib.request.Request(f"https://api.spotify.com/v1/search?{params}")
-        req.add_header("Authorization", f"Bearer {token}")
+        query = (query or "").strip()
+        if not query:
+            return {"ok": False, "error": "empty_query"}
+
+        q = urllib.parse.quote(query)
+        path = f"/search?q={q}&type=track,playlist&limit=15"
         try:
-            with urllib.request.urlopen(req) as resp:
-                payload = json.loads(resp.read())
-        except Exception as e:
-            decky_plugin.logger.error(f"SpotifHA: search échoué: {e}")
-            return {"ok": False, "error": "api_error"}
+            data = self._api_get(path, access_token)
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8")
+            except Exception:
+                pass
+            decky_plugin.logger.error(f"SpotifHA: echec search HTTP {e.code}: {body}")
+            return {"ok": False, "error": f"http_{e.code}"}
+        except Exception:
+            decky_plugin.logger.error("SpotifHA: echec search:\n" + traceback.format_exc())
+            return {"ok": False, "error": "request_failed"}
 
-        return {"ok": True, "raw": payload}
+        tracks = []
+        for item in (data.get("tracks") or {}).get("items", []) or []:
+            if not item:
+                continue
+            artists = ", ".join(a.get("name", "") for a in item.get("artists", []) or [])
+            tracks.append({
+                "uri": item.get("uri"),
+                "name": item.get("name"),
+                "artist": artists,
+            })
 
-    # -- MPRIS (contrôle temps réel, local, sans auth) ---------------------------
+        playlists = []
+        for item in (data.get("playlists") or {}).get("items", []) or []:
+            if not item:
+                continue
+            playlists.append({
+                "uri": item.get("uri"),
+                "name": item.get("name"),
+            })
 
-    async def play_pause(self) -> dict:
-        return await self._mpris_call("PlayPause")
+        decky_plugin.logger.info(f"SpotifHA: recherche OK, {len(tracks)} pistes, {len(playlists)} playlists")
+        return {"ok": True, "tracks": tracks, "playlists": playlists}
 
-    async def next_track(self) -> dict:
-        return await self._mpris_call("Next")
+    # ---------- MPRIS playback control ----------
 
-    async def previous_track(self) -> dict:
-        return await self._mpris_call("Previous")
-
-    async def open_uri(self, uri: str) -> dict:
-        return await self._mpris_call("OpenUri", uri)
-
-    async def set_volume(self, volume: float) -> dict:
-        # volume: 0.0 - 1.0
-        return await self._mpris_set_property("Volume", volume)
-
-    async def get_playback_state(self) -> dict:
-        return await self._mpris_get_properties()
-
-    async def _mpris_call(self, method: str, *args: str) -> dict:
-        cmd = [
-            "dbus-send", "--print-reply", "--session",
-            f"--dest={MPRIS_BUS_NAME}", MPRIS_PATH,
-            f"{MPRIS_PLAYER_IFACE}.{method}",
-        ]
-        cmd += [f"string:{a}" for a in args]
-        return await self._run(cmd)
-
-    async def _mpris_set_property(self, prop: str, value: float) -> dict:
-        cmd = [
-            "dbus-send", "--session", f"--dest={MPRIS_BUS_NAME}", MPRIS_PATH,
-            "org.freedesktop.DBus.Properties.Set",
-            f"string:{MPRIS_PLAYER_IFACE}", f"string:{prop}",
-            f"variant:double:{value}",
-        ]
-        return await self._run(cmd)
-
-    async def _mpris_get_properties(self) -> dict:
-        cmd = [
-            "dbus-send", "--print-reply", "--session", f"--dest={MPRIS_BUS_NAME}",
-            MPRIS_PATH, "org.freedesktop.DBus.Properties.GetAll",
-            f"string:{MPRIS_PLAYER_IFACE}",
-        ]
-        result = await self._run(cmd)
-        # NOTE: le parsing propre de la sortie dbus-send (format texte, pas JSON)
-        # reste à écrire — prévoir un vrai binding (dbus-next) si on veut du
-        # "now playing" fiable plutôt qu'une preuve de concept.
-        return result
-
-    async def _run(self, cmd: list[str]) -> dict:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    def _run(self, args):
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            env=_clean_subprocess_env(),
+            timeout=10,
         )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            decky_plugin.logger.error(f"SpotifHA: dbus-send échoué: {stderr.decode()}")
-            return {"ok": False, "error": stderr.decode()}
-        return {"ok": True, "output": stdout.decode()}
+
+    def _mpris_call(self, member, signature="", *values):
+        args = [
+            "dbus-send", "--session", "--print-reply", "--type=method_call",
+            f"--dest={MPRIS_BUS_NAME}", MPRIS_PATH,
+            f"{MPRIS_PLAYER_IFACE}.{member}",
+        ]
+        if signature:
+            args.append(signature)
+            args.extend(str(v) for v in values)
+        result = self._run(args)
+        if result.returncode != 0:
+            decky_plugin.logger.error(f"SpotifHA: dbus-send echoue ({member}): {result.stderr.strip()}")
+            return False
+        return True
+
+    def _mpris_set_property(self, prop_name, signature, value):
+        args = [
+            "dbus-send", "--session", "--print-reply", "--type=method_call",
+            f"--dest={MPRIS_BUS_NAME}", MPRIS_PATH,
+            f"{MPRIS_PROPS_IFACE}.Set",
+            "string:org.mpris.MediaPlayer2.Player",
+            f"string:{prop_name}",
+            f"variant:{signature}:{value}",
+        ]
+        result = self._run(args)
+        return result.returncode == 0
+
+    def _mpris_get_all(self):
+        args = [
+            "dbus-send", "--session", "--print-reply", "--type=method_call",
+            f"--dest={MPRIS_BUS_NAME}", MPRIS_PATH,
+            f"{MPRIS_PROPS_IFACE}.GetAll",
+            "string:org.mpris.MediaPlayer2.Player",
+        ]
+        result = self._run(args)
+        if result.returncode != 0:
+            decky_plugin.logger.error(f"SpotifHA: dbus-send GetAll echoue: {result.stderr.strip()}")
+            return None
+        return result.stdout
+
+    async def play_pause(self):
+        return {"ok": self._mpris_call("PlayPause")}
+
+    async def next_track(self):
+        return {"ok": self._mpris_call("Next")}
+
+    async def previous_track(self):
+        return {"ok": self._mpris_call("Previous")}
+
+    async def open_uri(self, uri: str):
+        return {"ok": self._mpris_call("OpenUri", "string:" + uri)}
+
+    async def set_volume(self, volume: float):
+        return {"ok": self._mpris_set_property("Volume", "double", volume)}
+
+    async def get_playback_state(self):
+        raw = self._mpris_get_all()
+        if raw is None:
+            return {"ok": False, "error": "mpris_unavailable"}
+        parsed = _parse_mpris_getall(raw)
+        return {"ok": True, **parsed}
+
+
+def _parse_mpris_getall(raw: str):
+    """Parse la sortie texte de dbus-send pour GetAll(Player) et en extrait
+    title / artist / art_url / status / position / volume.
+
+    La sortie de dbus-send n'est pas du JSON, c'est un dump texte imbrique
+    (dict entry / variant / struct ...). On extrait les champs un par un
+    avec des regex cibles plutot que d'essayer de parser toute la grammaire.
+    """
+    result = {
+        "status": None,
+        "title": None,
+        "artist": None,
+        "art_url": None,
+        "position": None,
+        "volume": None,
+    }
+
+    # PlaybackStatus
+    m = re.search(r'"PlaybackStatus"\svvariant\s*string\s*"([^"]+)"', raw)
+    if m:
+        result["status"] = m.group(1)
+
+    # Volume
+    m = re.search(r'"Volume"\svvariant\s*double\s*([0-9.]+)', raw)
+    if m:
+        try:
+            result["volume"] = float(m.group(1))
+        except ValueError:
+            pass
+
+    # Position (microseconds)
+    m = re.search(r'"Position"\svvariant\s*int64\s*(\d+)', raw)
+    if m:
+        try:
+            result["position"] = int(m.group(1))
+        except ValueError:
+            pass
+
+    # Metadata block: isole le sous-texte entre "Metadata" et la fin du dict
+    meta_match = re.search(r'"Metadata".*', raw, re.DOTALL)
+    meta_text = meta_match.group(0) if meta_match else raw
+
+    m = re.search(r'"xesam:title"\svvariant\s*string\s*"([^"]+)"', meta_text)
+    if m:
+        result["title"] = m.group(1)
+
+    m = re.search(r'"mpris:artUrl"\s*variant\s*string\s*"([^"]*)"', meta_text)
+    if m:
+        result["art_url"] = m.group(1)
+
+    # xesam:artist est un array de strings ; on prend toutes les valeurs string
+    # qui suivent "xesam:artist" jusqu'a la cle suivante.
+    artist_block_match = re.search(
+        r'"xesam:artist"\svvariant\s*array\s*\[(.*?)\]', meta_text, re.DOTALL
+    )
+    if artist_block_match:
+        names = re.findall(r'string\s*"([^"]*)"', artist_block_match.group(1))
+        if names:
+            result["artist"] = ", ".join(names)
+
+    return result

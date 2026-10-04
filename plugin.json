@@ -2,9 +2,10 @@
   "name": "SpotifHA",
   "author": "Axwell38",
   "flags": ["debug"],
+  "api_version": 1,
   "publish": {
-    "tags": ["spotify", "music"],
-    "description": "Pilote Spotify sur le Deck : lecture, playlists, recherche — depuis le Quick Access Menu.",
-    "image": "https://raw.githubusercontent.com/Axwell38/SpotifHA/main/assets/store-image.png"
+    "tags": ["spotify", "music", "media"],
+    "description": "Contrôle et navigue dans Spotify (lecture, recherche, playlists) depuis le Quick Access Menu.",
+    "image": "https://raw.githubusercontent.com/Axwell38/SpotifHA/main/assets/thumbnail.png"
   }
 }
